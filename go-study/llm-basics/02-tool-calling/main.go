@@ -7,13 +7,17 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"example.com/mod/llm-basics/internal/config"
 )
 
-func getWeather(city string) string {
-	return `{"city":"Singapore","temperature":30,"condition":"sunny"}`
-}
+const maxLoopIterations = 5
+
+const (
+	ErrInvalidArgument     = "INVALID_ARGUMENT"
+	ErrUnknownToolFunction = "UNKNOWN_TOOL_FUNCTION"
+)
 
 type ChatRequest struct {
 	Model    string    `json:"model"`
@@ -39,6 +43,17 @@ type ToolFunction struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`
+}
+
+type ToolResult struct {
+	OK    bool       `json:"ok"`
+	Data  any        `json:"data,omitempty"`
+	Error *ToolError `json:"error,omitempty"`
+}
+
+type ToolError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 type Message struct {
@@ -80,74 +95,180 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// tools := []Tool{
-	// 	{
-	// 		Type: "function",
-	// 		Function: ToolFunction{
-	// 			Name:        "get_weather",
-	// 			Description: "Get the current weather for a city",
-	// 			Parameters: map[string]any{
-	// 				"type": "object",
-	// 				"properties": map[string]any{
-	// 					"city": map[string]any{
-	// 						"type":        "string",
-	// 						"description": "The city name",
-	// 					},
-	// 				},
-	// 				"required": []string{"city"},
-	// 			},
-	// 		},
-	// 	},
-	// }
-	tools := make([]Tool, 0)
+	tools := []Tool{
+		{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        "get_weather",
+				Description: "Get the current weather for a city",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"city": map[string]any{
+							"type":        "string",
+							"description": "The city name",
+						},
+					},
+					"required": []string{"city"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        "get_date",
+				Description: "Get the current date",
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			},
+		},
+	}
 	messages := []Message{
 		{
 			Role:    "user",
-			Content: "What's the weather in Singapore?",
+			Content: "What's the weather today in Singapore?",
 		},
 	}
 
-	respBody := callModel(cfg.OpenRouterAPIKey, messages, tools)
-
-	var chatResp ChatResponse
-
-	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		panic(err)
-	}
-
-	var args WeatherArgs
-
-	toolCall := chatResp.Choices[0].Message.ToolCalls[0]
-
-	err = json.Unmarshal(
-		[]byte(toolCall.Function.Arguments),
-		&args,
-	)
+	answer, err := agentLoop(cfg, messages, tools)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	var toolResult string
+	fmt.Println(answer)
 
-	switch toolCall.Function.Name {
-	case "get_weather":
-		toolResult = getWeather(args.City)
-	default:
-		log.Fatalf("Unknown tool function: %s", toolCall.Function.Name)
-	}
-
-	messages = append(messages, Message{
-		Role:       "tool",
-		Content:    toolResult,
-		ToolCallID: toolCall.ID,
-	})
-
-	respBody = callModel(cfg.OpenRouterAPIKey, messages, tools)
-
-	fmt.Println(string(respBody))
 }
 
-func callModel(apiKey string, messages []Message, tools []Tool) []byte {
+func getWeather(city string) ToolResult {
+	return ToolResult{
+		OK: true,
+		Data: map[string]any{
+			"city":        city,
+			"temperature": 30,
+			"condition":   "sunny",
+		},
+	}
+}
+
+func agentLoop(cfg config.Config, messages []Message, tools []Tool) (string, error) {
+	for i := 0; i < maxLoopIterations; i++ {
+		respBody, err := callModel(cfg.OpenRouterAPIKey, messages, tools)
+		if err != nil {
+			return "", fmt.Errorf("call model: %w", err)
+		}
+		log.Println(respBody)
+
+		var chatResp ChatResponse
+
+		if err := json.Unmarshal([]byte(respBody), &chatResp); err != nil {
+			return "", fmt.Errorf("parse model response: %w", err)
+		}
+		if len(chatResp.Choices) == 0 {
+			return "", fmt.Errorf("model response has no choices")
+		}
+
+		message := chatResp.Choices[0].Message
+		if len(message.ToolCalls) == 0 {
+			fmt.Println("model didn't call any tool")
+			return message.Content, nil
+		}
+
+		messages = append(messages, Message{
+			Role:      message.Role,
+			Content:   message.Content,
+			ToolCalls: message.ToolCalls,
+		})
+
+		toolCalls := message.ToolCalls
+
+		toolMessages, err1 := executeToolCalls(toolCalls)
+		if err1 != nil {
+			return "", err1
+		}
+		messages = append(messages, toolMessages...)
+	}
+	return "", fmt.Errorf("max loop iterations reached without a final answer")
+}
+
+func executeToolCalls(toolCalls []ToolCall) ([]Message, error) {
+	messages := make([]Message, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		toolResult := executeToolCall(toolCall)
+
+		toolContent, err := json.Marshal(toolResult)
+		if err != nil {
+			return nil, fmt.Errorf("marshal tool result: %w", err)
+		}
+
+		messages = append(messages, Message{
+			Role:       "tool",
+			Content:    string(toolContent),
+			ToolCallID: toolCall.ID,
+		})
+	}
+	return messages, nil
+}
+
+func executeToolCall(toolCall ToolCall) ToolResult {
+	var toolResult ToolResult
+
+	switch toolCall.Function.Name {
+
+	case "get_weather":
+		var args WeatherArgs
+		if err := json.Unmarshal(
+			[]byte(toolCall.Function.Arguments),
+			&args,
+		); err != nil {
+			log.Printf(
+				"parse get_weather arguments failed: %v, args=%q",
+				err,
+				toolCall.Function.Arguments,
+			)
+			toolResult = ToolResult{
+				OK: false,
+				Error: &ToolError{
+					Code:    ErrInvalidArgument,
+					Message: "arguments must be valid JSON matching the tool schema",
+				},
+			}
+			return toolResult
+		}
+		if args.City == "" {
+			toolResult = ToolResult{
+				OK: false,
+				Error: &ToolError{
+					Code:    ErrInvalidArgument,
+					Message: "city is required",
+				},
+			}
+			return toolResult
+		}
+		toolResult = getWeather(args.City)
+
+	case "get_date":
+		toolResult = ToolResult{
+			OK: true,
+			Data: map[string]string{
+				"date": time.Now().Format("2006-01-02"),
+			},
+		}
+
+	default:
+		toolResult = ToolResult{
+			OK: false,
+			Error: &ToolError{
+				Code:    ErrUnknownToolFunction,
+				Message: fmt.Sprintf("unknown tool function: %s", toolCall.Function.Name),
+			},
+		}
+	}
+	return toolResult
+}
+
+func callModel(apiKey string, messages []Message, tools []Tool) (string, error) {
 	reqBody := ChatRequest{
 		Model:    "deepseek/deepseek-v4-flash-0731",
 		Messages: messages,
@@ -156,12 +277,12 @@ func callModel(apiKey string, messages []Message, tools []Tool) []byte {
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		log.Fatalf("Error marshalling request body: %v", err)
+		return "", fmt.Errorf("marshal request body: %w", err)
 	}
 
 	req, err := http.NewRequest(http.MethodPost, "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(body))
 	if err != nil {
-		log.Fatalf("Error creating request: %v", err)
+		return "", fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -169,18 +290,21 @@ func callModel(apiKey string, messages []Message, tools []Tool) []byte {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Fatalf("Error making request: %v", err)
+		return "", fmt.Errorf("make request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("Request failed with status: %s", resp.Status)
-	}
-
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatalf("Error reading response body: %v", err)
+		return "", fmt.Errorf("Error reading response body: %w", err)
 	}
 
-	return respBody
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("model API returned %s: %s",
+			resp.Status,
+			string(respBody),
+		)
+	}
+
+	return string(respBody), nil
 }
