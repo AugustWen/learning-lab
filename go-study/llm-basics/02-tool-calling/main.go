@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +19,8 @@ const maxLoopIterations = 5
 const (
 	ErrInvalidArgument     = "INVALID_ARGUMENT"
 	ErrUnknownToolFunction = "UNKNOWN_TOOL_FUNCTION"
+	ErrToolExecution       = "TOOL_EXECUTION_ERROR"
+	ErrToolTimeout         = "TOOL_TIMEOUT"
 )
 
 type ChatRequest struct {
@@ -54,6 +58,26 @@ type ToolResult struct {
 type ToolError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type ToolHandler func(ctx context.Context, args json.RawMessage) (ToolResult, error)
+
+type RegisteredTool struct {
+	Name        string
+	Description string
+	Parameters  map[string]any
+	Handler     ToolHandler
+	Timeout     time.Duration
+}
+
+type ToolRegistry struct {
+	tools map[string]RegisteredTool
+}
+
+func NewToolRegistry() *ToolRegistry {
+	return &ToolRegistry{
+		tools: make(map[string]RegisteredTool),
+	}
 }
 
 type Message struct {
@@ -95,36 +119,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tools := []Tool{
-		{
-			Type: "function",
-			Function: ToolFunction{
-				Name:        "get_weather",
-				Description: "Get the current weather for a city",
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"city": map[string]any{
-							"type":        "string",
-							"description": "The city name",
-						},
-					},
-					"required": []string{"city"},
-				},
-			},
-		},
-		{
-			Type: "function",
-			Function: ToolFunction{
-				Name:        "get_date",
-				Description: "Get the current date",
-				Parameters: map[string]any{
-					"type":       "object",
-					"properties": map[string]any{},
-				},
-			},
-		},
+	toolRegistry := NewToolRegistry()
+	if err := toolRegistry.RegisterTool(weatherToolRegister()); err != nil {
+		log.Fatal(err)
 	}
+	if err := toolRegistry.RegisterTool(dateToolRegister()); err != nil {
+		log.Fatal(err)
+	}
+
 	messages := []Message{
 		{
 			Role:    "user",
@@ -132,7 +134,8 @@ func main() {
 		},
 	}
 
-	answer, err := agentLoop(cfg, messages, tools)
+	ctx := context.Background()
+	answer, err := agentLoop(ctx, cfg, messages, toolRegistry)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -141,7 +144,69 @@ func main() {
 
 }
 
+func weatherToolRegister() RegisteredTool {
+	return RegisteredTool{
+		Name:        "get_weather",
+		Description: "Get the current weather for a city",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"city": map[string]any{
+					"type":        "string",
+					"description": "The city name",
+					"minLength":   1,
+				},
+			},
+			"required":             []string{"city"},
+			"additionalProperties": false,
+		},
+		Handler: func(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+			var weatherArgs WeatherArgs
+			if err := json.Unmarshal(args, &weatherArgs); err != nil {
+				return ToolResult{
+					OK: false,
+					Error: &ToolError{
+						Code:    ErrInvalidArgument,
+						Message: fmt.Sprintf("invalid arguments: %v", err),
+					},
+				}, nil
+			}
+			return getWeather(weatherArgs.City), nil
+		},
+		Timeout: 5 * time.Second,
+	}
+}
+
+func dateToolRegister() RegisteredTool {
+	return RegisteredTool{
+		Name:        "get_date",
+		Description: "Get the current date",
+		Parameters: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		},
+		Handler: func(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+			return ToolResult{
+				OK: true,
+				Data: map[string]any{
+					"date": time.Now().Format("2006-01-02"),
+				},
+			}, nil
+		},
+		Timeout: 5 * time.Second,
+	}
+}
+
 func getWeather(city string) ToolResult {
+	if city == "" {
+		return ToolResult{
+			OK: false,
+			Error: &ToolError{
+				Code:    ErrInvalidArgument,
+				Message: "city is required",
+			},
+		}
+	}
 	return ToolResult{
 		OK: true,
 		Data: map[string]any{
@@ -152,9 +217,9 @@ func getWeather(city string) ToolResult {
 	}
 }
 
-func agentLoop(cfg config.Config, messages []Message, tools []Tool) (string, error) {
+func agentLoop(ctx context.Context, cfg config.Config, messages []Message, toolRegistry *ToolRegistry) (string, error) {
 	for i := 0; i < maxLoopIterations; i++ {
-		respBody, err := callModel(cfg.OpenRouterAPIKey, messages, tools)
+		respBody, err := callModel(ctx, cfg.OpenRouterAPIKey, messages, toolRegistry.Definitions())
 		if err != nil {
 			return "", fmt.Errorf("call model: %w", err)
 		}
@@ -183,7 +248,7 @@ func agentLoop(cfg config.Config, messages []Message, tools []Tool) (string, err
 
 		toolCalls := message.ToolCalls
 
-		toolMessages, err1 := executeToolCalls(toolCalls)
+		toolMessages, err1 := executeToolCalls(ctx, toolRegistry, toolCalls)
 		if err1 != nil {
 			return "", err1
 		}
@@ -192,14 +257,14 @@ func agentLoop(cfg config.Config, messages []Message, tools []Tool) (string, err
 	return "", fmt.Errorf("max loop iterations reached without a final answer")
 }
 
-func executeToolCalls(toolCalls []ToolCall) ([]Message, error) {
+func executeToolCalls(ctx context.Context, registry *ToolRegistry, toolCalls []ToolCall) ([]Message, error) {
 	messages := make([]Message, 0, len(toolCalls))
 	for _, toolCall := range toolCalls {
-		toolResult := executeToolCall(toolCall)
+		toolResult := executeToolCall(ctx, registry, toolCall)
 
 		toolContent, err := json.Marshal(toolResult)
 		if err != nil {
-			return nil, fmt.Errorf("marshal tool result: %w", err)
+			return messages, fmt.Errorf("marshal tool result for tool call %q: %w", toolCall.Function.Name, err)
 		}
 
 		messages = append(messages, Message{
@@ -211,52 +276,48 @@ func executeToolCalls(toolCalls []ToolCall) ([]Message, error) {
 	return messages, nil
 }
 
-func executeToolCall(toolCall ToolCall) ToolResult {
-	var toolResult ToolResult
+func (r *ToolRegistry) RegisterTool(tool RegisteredTool) error {
+	if tool.Name == "" {
+		return fmt.Errorf("tool name is required")
+	}
+	if tool.Handler == nil {
+		return fmt.Errorf("tool handler is required")
+	}
+	if _, exists := r.tools[tool.Name]; exists {
+		return fmt.Errorf("tool %q is already registered", tool.Name)
+	}
+	if tool.Timeout <= 0 {
+		return fmt.Errorf("tool timeout must be greater than zero")
+	}
+	r.tools[tool.Name] = tool
+	return nil
+}
 
-	switch toolCall.Function.Name {
+func (r *ToolRegistry) GetTool(name string) (RegisteredTool, bool) {
+	tool, exists := r.tools[name]
+	return tool, exists
+}
 
-	case "get_weather":
-		var args WeatherArgs
-		if err := json.Unmarshal(
-			[]byte(toolCall.Function.Arguments),
-			&args,
-		); err != nil {
-			log.Printf(
-				"parse get_weather arguments failed: %v, args=%q",
-				err,
-				toolCall.Function.Arguments,
-			)
-			toolResult = ToolResult{
-				OK: false,
-				Error: &ToolError{
-					Code:    ErrInvalidArgument,
-					Message: "arguments must be valid JSON matching the tool schema",
-				},
-			}
-			return toolResult
-		}
-		if args.City == "" {
-			toolResult = ToolResult{
-				OK: false,
-				Error: &ToolError{
-					Code:    ErrInvalidArgument,
-					Message: "city is required",
-				},
-			}
-			return toolResult
-		}
-		toolResult = getWeather(args.City)
-
-	case "get_date":
-		toolResult = ToolResult{
-			OK: true,
-			Data: map[string]string{
-				"date": time.Now().Format("2006-01-02"),
+func (r *ToolRegistry) Definitions() []Tool {
+	tools := make([]Tool, 0, len(r.tools))
+	for _, tool := range r.tools {
+		tools = append(tools, Tool{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  tool.Parameters,
 			},
-		}
+		})
+	}
+	return tools
+}
 
-	default:
+func executeToolCall(ctx context.Context, registry *ToolRegistry, toolCall ToolCall) ToolResult {
+	var toolResult ToolResult
+	// 查tool
+	tool, exists := registry.GetTool(toolCall.Function.Name)
+	if !exists {
 		toolResult = ToolResult{
 			OK: false,
 			Error: &ToolError{
@@ -264,11 +325,62 @@ func executeToolCall(toolCall ToolCall) ToolResult {
 				Message: fmt.Sprintf("unknown tool function: %s", toolCall.Function.Name),
 			},
 		}
+		return toolResult
+	}
+
+	rawArgs := json.RawMessage(toolCall.Function.Arguments)
+
+	// 2. Validate the arguments
+	if err := validateJSONArguments(rawArgs); err != nil {
+		return ToolResult{
+			OK: false,
+			Error: &ToolError{
+				Code:    ErrInvalidArgument,
+				Message: fmt.Sprintf("invalid arguments: %v", err),
+			},
+		}
+	}
+
+	// 3.schema
+	if err := validateArguments(tool.Parameters, rawArgs); err != nil {
+		return ToolResult{
+			OK: false,
+			Error: &ToolError{
+				Code:    ErrInvalidArgument,
+				Message: fmt.Sprintf("invalid arguments: %v", err),
+			},
+		}
+	}
+
+	// 4. tool timeout
+	toolCtx, cancel := context.WithTimeout(ctx, tool.Timeout)
+	defer cancel()
+
+	// 5. Execute the tool handler
+	toolResult, err := tool.Handler(toolCtx, rawArgs)
+	if errors.Is(toolCtx.Err(), context.DeadlineExceeded) {
+		return ToolResult{
+			OK: false,
+			Error: &ToolError{
+				Code:    ErrToolTimeout,
+				Message: "tool execution timed out",
+			},
+		}
+	}
+
+	if err != nil {
+		return ToolResult{
+			OK: false,
+			Error: &ToolError{
+				Code:    ErrToolExecution,
+				Message: fmt.Sprintf("tool execution failed: %v", err),
+			},
+		}
 	}
 	return toolResult
 }
 
-func callModel(apiKey string, messages []Message, tools []Tool) (string, error) {
+func callModel(ctx context.Context, apiKey string, messages []Message, tools []Tool) (string, error) {
 	reqBody := ChatRequest{
 		Model:    "deepseek/deepseek-v4-flash-0731",
 		Messages: messages,
@@ -280,7 +392,7 @@ func callModel(apiKey string, messages []Message, tools []Tool) (string, error) 
 		return "", fmt.Errorf("marshal request body: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(body))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -307,4 +419,96 @@ func callModel(apiKey string, messages []Message, tools []Tool) (string, error) 
 	}
 
 	return string(respBody), nil
+}
+
+func validateJSONArguments(args json.RawMessage) error {
+	if len(args) == 0 {
+		return fmt.Errorf("arguments is empty")
+	}
+	if !json.Valid(args) {
+		return fmt.Errorf("arguments is not valid JSON")
+	}
+	return nil
+}
+
+func validateArguments(schema map[string]any, args json.RawMessage) error {
+	var argsMap map[string]any
+	if err := json.Unmarshal(args, &argsMap); err != nil {
+		return fmt.Errorf("unmarshal arguments: %w", err)
+	}
+
+	// Check for required properties
+	if requiredField, exists := schema["required"]; exists {
+		if requiredList, ok := requiredField.([]string); ok {
+			for _, reqStr := range requiredList {
+				if _, exists := argsMap[reqStr]; !exists {
+					return fmt.Errorf("missing required property: %s", reqStr)
+				}
+
+			}
+		}
+	}
+
+	schemaProperties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("invalid schema: properties field is missing or not an object")
+	}
+	// Check for additional properties
+	if additionalProperties, exists := schema["additionalProperties"]; exists {
+		if !additionalProperties.(bool) {
+			for key := range argsMap {
+				if _, exists := schemaProperties[key]; !exists {
+					return fmt.Errorf("additional property %s is not allowed", key)
+				}
+			}
+		}
+	}
+
+	for name, propertySchemaValue := range schemaProperties {
+		value, exists := argsMap[name]
+		if !exists {
+			continue // Skip validation for properties that are not present
+		}
+		propertySchema, ok := propertySchemaValue.(map[string]any)
+		if !ok {
+			return fmt.Errorf("invalid schema for property %s: not an object", name)
+		}
+
+		if expectedType, ok := propertySchema["type"].(string); ok {
+			switch expectedType {
+			case "string":
+				strValue, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("property %s is not of type string", name)
+				}
+				// Check length
+				if minLength, exists := propertySchema["minLength"]; exists {
+					if minLength, ok := minLength.(int); ok {
+						if len(strValue) < minLength {
+							return fmt.Errorf("property %s is too short: got %d, want at least %d", name, len(strValue), minLength)
+						}
+					}
+				}
+			case "number":
+				if _, ok := value.(float64); !ok {
+					return fmt.Errorf("property %s is not of type number", name)
+				}
+			case "boolean":
+				if _, ok := value.(bool); !ok {
+					return fmt.Errorf("property %s is not of type boolean", name)
+				}
+			case "object":
+				if _, ok := value.(map[string]any); !ok {
+					return fmt.Errorf("property %s is not of type object", name)
+				}
+			case "array":
+				if _, ok := value.([]any); !ok {
+					return fmt.Errorf("property %s is not of type array", name)
+				}
+			default:
+				return fmt.Errorf("unsupported type %s for property %s", expectedType, name)
+			}
+		}
+	}
+	return nil
 }
