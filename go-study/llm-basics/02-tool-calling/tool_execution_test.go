@@ -43,7 +43,10 @@ func TestToolCall_Execute(t *testing.T) {
 	}
 	argsJSON, _ := json.Marshal(args)
 
-	result := executeToolCall(context.Background(), registry, newToolCall("TestTool", string(argsJSON)))
+	result, err := executeToolCall(context.Background(), registry, newToolCall("TestTool", string(argsJSON)))
+	if err != nil {
+		t.Fatalf("failed to execute tool call: %v", err)
+	}
 
 	if !result.OK {
 		t.Fatalf("expected result OK to be true, got false")
@@ -58,7 +61,10 @@ func TestToolCall_ExecuteWithUnknownTool(t *testing.T) {
 
 	call := newToolCall("not_exists", "{}")
 
-	result := executeToolCall(context.Background(), registry, call)
+	result, err := executeToolCall(context.Background(), registry, call)
+	if err != nil {
+		t.Fatalf("failed to execute tool call: %v", err)
+	}
 
 	if result.OK {
 		t.Fatalf("expected result OK to be false for unknown tool, got true")
@@ -96,7 +102,10 @@ func TestToolCall_ExecuteWithHandlerError(t *testing.T) {
 
 	call := newToolCall("ErrorTool", "{}")
 
-	result := executeToolCall(context.Background(), registry, call)
+	result, err := executeToolCall(context.Background(), registry, call)
+	if err != nil {
+		t.Fatalf("failed to execute tool call: %v", err)
+	}
 
 	if result.OK {
 		t.Fatalf("expected result OK to be false for handler error, got true")
@@ -140,7 +149,10 @@ func TestToolCall_BusinessFailed(t *testing.T) {
 
 	call := newToolCall("BusinessFailTool", "{}")
 
-	result := executeToolCall(context.Background(), registry, call)
+	result, err := executeToolCall(context.Background(), registry, call)
+	if err != nil {
+		t.Fatalf("failed to execute tool call: %v", err)
+	}
 
 	if result.OK {
 		t.Fatalf("expected result OK to be false for business failure, got true")
@@ -257,11 +269,14 @@ func TestExecuteToolCall_ArgumentValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := executeToolCall(
+			result, err := executeToolCall(
 				context.Background(),
 				registry,
 				newToolCall("get_weather", tt.args),
 			)
+			if err != nil {
+				t.Fatalf("failed to execute tool call: %v", err)
+			}
 
 			if result.OK != tt.wantOK {
 				t.Fatalf(
@@ -286,5 +301,183 @@ func TestExecuteToolCall_ArgumentValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestExecuteToolCall_Timeout(t *testing.T) {
+	registry := NewToolRegistry()
+
+	tool := RegisteredTool{
+		Name:        "slow_tool",
+		Description: "A tool that takes a long time to complete",
+		Parameters: map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"additionalProperties": false,
+		},
+		Handler: func(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+			select {
+			case <-time.After(1 * time.Second):
+				return ToolResult{
+					OK:   true,
+					Data: "finished",
+				}, nil
+			case <-ctx.Done():
+				return ToolResult{}, ctx.Err()
+			}
+		},
+		Timeout: 50 * time.Millisecond,
+	}
+	if err := registry.RegisterTool(tool); err != nil {
+		t.Fatalf("RegisterTool() unexpected error: %v", err)
+	}
+
+	result, err := executeToolCall(context.Background(), registry, newToolCall("slow_tool", "{}"))
+	if err != nil {
+		t.Fatalf("failed to execute tool call: %v", err)
+	}
+
+	if result.OK {
+		t.Fatalf("expected result OK to be false, got true")
+	}
+
+	if result.Error == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if result.Error.Code != ErrToolTimeout {
+		t.Errorf(
+			"error code = %q, want %q",
+			result.Error.Code,
+			ErrToolTimeout,
+		)
+	}
+
+}
+
+func TestExecuteToolCall_ContextCanceled(t *testing.T) {
+	registry := NewToolRegistry()
+
+	tool := RegisteredTool{
+		Name:        "cancellable_tool",
+		Description: "A tool that can be cancelled",
+		Parameters: map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"additionalProperties": false,
+		},
+		Handler: func(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+			select {
+			case <-time.After(1 * time.Second):
+				return ToolResult{
+					OK:   true,
+					Data: "finished",
+				}, nil
+			case <-ctx.Done():
+				return ToolResult{}, ctx.Err()
+			}
+		},
+		Timeout: 2 * time.Second,
+	}
+	if err := registry.RegisterTool(tool); err != nil {
+		t.Fatalf("RegisterTool() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel the context immediately
+
+	_, err := executeToolCall(ctx, registry, newToolCall("cancellable_tool", "{}"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+
+}
+
+// timeout不能强制终止
+func TestHandler_SleepIgnoresCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+
+	time.Sleep(200 * time.Millisecond)
+
+	elapsed := time.Since(start)
+
+	if elapsed < 200*time.Millisecond {
+		t.Fatalf("sleep unexpectedly interrupted")
+	}
+
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("expected context canceled")
+	}
+}
+
+// timeout能强制终止
+func TestHandler_ContextAwareWorkStopsEarly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("work should have been canceled")
+
+	case <-ctx.Done():
+	}
+
+	elapsed := time.Since(start)
+
+	if elapsed >= time.Second {
+		t.Fatalf(
+			"cancellation did not stop work early: %v",
+			elapsed,
+		)
+	}
+
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf(
+			"expected context.Canceled, got %v",
+			ctx.Err(),
+		)
+	}
+}
+
+func TestContext_ParentCancelCancelsChild(t *testing.T) {
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	childCtx, childCancel := context.WithTimeout(parentCtx, time.Second)
+
+	defer childCancel() // Ensure the child context is canceled to avoid resource leaks
+	parentCancel()      // Cancel the parent context
+
+	select {
+	case <-childCtx.Done():
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("child context did not cancel in time")
+	}
+
+	if !errors.Is(childCtx.Err(), context.Canceled) {
+		t.Fatalf("expected parent context to be canceled, got: %v", childCtx.Err())
+	}
+}
+
+func TestContext_ChildCancelCancelsParent(t *testing.T) {
+	parentCtx := context.Background()
+	childCtx, childCancel := context.WithTimeout(parentCtx, 20*time.Millisecond)
+
+	defer childCancel() // Ensure the child context is canceled to avoid resource leaks
+
+	<-childCtx.Done() // Wait for the child context to be canceled
+
+	if !errors.Is(childCtx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("expected parent context to be canceled, got: %v", childCtx.Err())
+	}
+	if parentCtx.Err() != nil {
+		t.Fatalf("expected parent context to be unaffected, got: %v", parentCtx.Err())
 	}
 }

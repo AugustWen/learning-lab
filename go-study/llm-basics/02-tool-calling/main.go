@@ -260,7 +260,10 @@ func agentLoop(ctx context.Context, cfg config.Config, messages []Message, toolR
 func executeToolCalls(ctx context.Context, registry *ToolRegistry, toolCalls []ToolCall) ([]Message, error) {
 	messages := make([]Message, 0, len(toolCalls))
 	for _, toolCall := range toolCalls {
-		toolResult := executeToolCall(ctx, registry, toolCall)
+		toolResult, err := executeToolCall(ctx, registry, toolCall)
+		if err != nil {
+			return messages, fmt.Errorf("execute tool call %q: %w", toolCall.Function.Name, err)
+		}
 
 		toolContent, err := json.Marshal(toolResult)
 		if err != nil {
@@ -313,7 +316,7 @@ func (r *ToolRegistry) Definitions() []Tool {
 	return tools
 }
 
-func executeToolCall(ctx context.Context, registry *ToolRegistry, toolCall ToolCall) ToolResult {
+func executeToolCall(ctx context.Context, registry *ToolRegistry, toolCall ToolCall) (ToolResult, error) {
 	var toolResult ToolResult
 	// 查tool
 	tool, exists := registry.GetTool(toolCall.Function.Name)
@@ -325,7 +328,7 @@ func executeToolCall(ctx context.Context, registry *ToolRegistry, toolCall ToolC
 				Message: fmt.Sprintf("unknown tool function: %s", toolCall.Function.Name),
 			},
 		}
-		return toolResult
+		return toolResult, nil
 	}
 
 	rawArgs := json.RawMessage(toolCall.Function.Arguments)
@@ -338,7 +341,7 @@ func executeToolCall(ctx context.Context, registry *ToolRegistry, toolCall ToolC
 				Code:    ErrInvalidArgument,
 				Message: fmt.Sprintf("invalid arguments: %v", err),
 			},
-		}
+		}, nil
 	}
 
 	// 3.schema
@@ -349,7 +352,7 @@ func executeToolCall(ctx context.Context, registry *ToolRegistry, toolCall ToolC
 				Code:    ErrInvalidArgument,
 				Message: fmt.Sprintf("invalid arguments: %v", err),
 			},
-		}
+		}, nil
 	}
 
 	// 4. tool timeout
@@ -357,27 +360,31 @@ func executeToolCall(ctx context.Context, registry *ToolRegistry, toolCall ToolC
 	defer cancel()
 
 	// 5. Execute the tool handler
-	toolResult, err := tool.Handler(toolCtx, rawArgs)
-	if errors.Is(toolCtx.Err(), context.DeadlineExceeded) {
-		return ToolResult{
-			OK: false,
-			Error: &ToolError{
-				Code:    ErrToolTimeout,
-				Message: "tool execution timed out",
-			},
+	result, err := tool.Handler(toolCtx, rawArgs)
+	if err != nil {
+		switch {
+		case errors.Is(toolCtx.Err(), context.DeadlineExceeded):
+			return ToolResult{
+				OK: false,
+				Error: &ToolError{
+					Code:    ErrToolTimeout,
+					Message: "tool execution timed out",
+				},
+			}, nil
+		case errors.Is(ctx.Err(), context.Canceled):
+			return ToolResult{}, ctx.Err()
+		default:
+			return ToolResult{
+				OK: false,
+				Error: &ToolError{
+					Code:    ErrToolExecution,
+					Message: fmt.Sprintf("tool execution failed: %v", err),
+				},
+			}, nil
 		}
 	}
 
-	if err != nil {
-		return ToolResult{
-			OK: false,
-			Error: &ToolError{
-				Code:    ErrToolExecution,
-				Message: fmt.Sprintf("tool execution failed: %v", err),
-			},
-		}
-	}
-	return toolResult
+	return result, nil
 }
 
 func callModel(ctx context.Context, apiKey string, messages []Message, tools []Tool) (string, error) {
