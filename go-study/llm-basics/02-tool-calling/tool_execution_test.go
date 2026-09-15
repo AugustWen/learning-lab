@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"strings"
 	"testing"
 	"time"
 )
@@ -479,5 +482,205 @@ func TestContext_ChildCancelCancelsParent(t *testing.T) {
 	}
 	if parentCtx.Err() != nil {
 		t.Fatalf("expected parent context to be unaffected, got: %v", parentCtx.Err())
+	}
+}
+
+func TestTracerEmit(t *testing.T) {
+	var buf bytes.Buffer
+
+	logger := log.New(&buf, "", 0)
+	tracer := NewTracerWithLogger(logger)
+
+	tracer.Emit(TraceEvent{
+		Iteration: 1,
+		Event:     "model_call",
+		Latency:   123 * time.Millisecond,
+	})
+
+	var event TraceEvent
+
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &event); err != nil {
+		t.Fatalf("unmarshal trace event: %v", err)
+	}
+
+	if event.TraceID != tracer.TraceID {
+		t.Errorf("TraceID = %q, want %q", event.TraceID, tracer.TraceID)
+	}
+
+	if event.Iteration != 1 {
+		t.Errorf("Iteration = %d, want 1", event.Iteration)
+	}
+
+	if event.Event != "model_call" {
+		t.Errorf("Event = %q, want model_call", event.Event)
+	}
+
+	if event.Latency != 123*time.Millisecond {
+		t.Errorf("Latency = %v, want 123ms", event.Latency)
+	}
+}
+
+func TestTracerToolCall_Success(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	tracer := NewTracerWithLogger(logger)
+
+	toolCall := ToolCall{
+		ID:   "call-1",
+		Type: "function",
+	}
+	toolCall.Function.Name = "get_weather"
+	toolCall.Function.Arguments = `{"city":"Singapore"}`
+
+	result := ToolResult{
+		OK: true,
+		Data: map[string]any{
+			"temperature": 30,
+		},
+	}
+
+	tracer.ToolCall(
+		2,
+		toolCall,
+		result,
+		50*time.Millisecond,
+		nil,
+	)
+
+	var event TraceEvent
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &event); err != nil {
+		t.Fatalf("unmarshal trace event: %v", err)
+	}
+
+	if event.TraceID != tracer.TraceID {
+		t.Errorf("TraceID = %q, want %q", event.TraceID, tracer.TraceID)
+	}
+
+	if event.Iteration != 2 {
+		t.Errorf("Iteration = %d, want 2", event.Iteration)
+	}
+
+	if event.Event != "tool_call" {
+		t.Errorf("Event = %q, want tool_call", event.Event)
+	}
+
+	if event.ToolName != "get_weather" {
+		t.Errorf("ToolName = %q, want get_weather", event.ToolName)
+	}
+
+	if event.ToolArgs != `{"city":"Singapore"}` {
+		t.Errorf("ToolArgs = %v", event.ToolArgs)
+	}
+
+	if event.Latency != 50*time.Millisecond {
+		t.Errorf("Latency = %v, want 50ms", event.Latency)
+	}
+
+	if event.Error != "" {
+		t.Errorf("Error = %q, want empty", event.Error)
+	}
+}
+
+func TestTracerToolCall_Error(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	tracer := NewTracerWithLogger(logger)
+
+	toolCall := ToolCall{}
+	toolCall.Function.Name = "get_weather"
+	toolCall.Function.Arguments = `{"city":"Singapore"}`
+
+	execErr := errors.New("context canceled")
+
+	tracer.ToolCall(
+		1,
+		toolCall,
+		nil,
+		20*time.Millisecond,
+		execErr,
+	)
+
+	var event TraceEvent
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &event); err != nil {
+		t.Fatalf("unmarshal trace event: %v", err)
+	}
+
+	if event.Error != "context canceled" {
+		t.Errorf(
+			"Error = %q, want %q",
+			event.Error,
+			"context canceled",
+		)
+	}
+
+	if event.ToolResult != nil {
+		t.Errorf("ToolResult = %#v, want nil", event.ToolResult)
+	}
+}
+
+func TestTracer_SameTraceIDAcrossEvents(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	tracer := NewTracerWithLogger(logger)
+
+	tracer.Emit(TraceEvent{
+		Iteration: 0,
+		Event:     "model_call",
+	})
+
+	tracer.Emit(TraceEvent{
+		Iteration: 1,
+		Event:     "model_call",
+	})
+
+	lines := strings.Split(
+		strings.TrimSpace(buf.String()),
+		"\n",
+	)
+
+	if len(lines) != 2 {
+		t.Fatalf("got %d trace events, want 2", len(lines))
+	}
+
+	var first TraceEvent
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatal(err)
+	}
+
+	var second TraceEvent
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+		t.Fatal(err)
+	}
+
+	if first.TraceID != second.TraceID {
+		t.Errorf(
+			"TraceID differs: %q != %q",
+			first.TraceID,
+			second.TraceID,
+		)
+	}
+
+	if first.TraceID != tracer.TraceID {
+		t.Errorf("unexpected TraceID %q", first.TraceID)
+	}
+}
+
+func TestNewTracer_UniqueTraceID(t *testing.T) {
+	tracer1 := NewTracer()
+	tracer2 := NewTracer()
+
+	if tracer1.TraceID == "" {
+		t.Fatal("tracer1 TraceID is empty")
+	}
+
+	if tracer2.TraceID == "" {
+		t.Fatal("tracer2 TraceID is empty")
+	}
+
+	if tracer1.TraceID == tracer2.TraceID {
+		t.Fatalf(
+			"TraceIDs should differ, got %q",
+			tracer1.TraceID,
+		)
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
+
 	"example.com/mod/llm-basics/internal/config"
 )
 
@@ -111,6 +113,76 @@ type ChatResponse struct {
 		TotalTokens      int     `json:"total_tokens"`
 		Cost             float64 `json:"cost"`
 	} `json:"usage"`
+}
+
+type TraceEvent struct {
+	TraceID   string `json:"trace_id"`
+	Iteration int    `json:"iteration"`
+	Event     string `json:"event"`
+
+	ModelInput  any `json:"model_input,omitempty"`
+	ModelOutput any `json:"model_output,omitempty"`
+
+	ToolName   string `json:"tool_name,omitempty"`
+	ToolArgs   any    `json:"tool_args,omitempty"`
+	ToolResult any    `json:"tool_result,omitempty"`
+
+	Latency time.Duration `json:"latency,omitempty"`
+	Error   string        `json:"error,omitempty"`
+}
+
+type Tracer struct {
+	TraceID string
+	logger  *log.Logger
+}
+
+func NewTracer() *Tracer {
+	return &Tracer{
+		TraceID: uuid.New().String(),
+		logger:  log.Default(),
+	}
+}
+
+func NewTracerWithLogger(logger *log.Logger) *Tracer {
+	return &Tracer{
+		TraceID: uuid.New().String(),
+		logger:  logger,
+	}
+}
+
+func (t *Tracer) Emit(event TraceEvent) {
+	event.TraceID = t.TraceID
+
+	b, err := json.Marshal(event)
+	if err != nil {
+		t.logger.Printf("marshal trace event: %v", err)
+		return
+	}
+
+	t.logger.Println(string(b))
+}
+
+func (t *Tracer) ToolCall(
+	iteration int,
+	toolCall ToolCall,
+	result any,
+	latency time.Duration,
+	err error,
+) {
+	event := TraceEvent{
+		Iteration:  iteration,
+		Event:      "tool_call",
+		ToolName:   toolCall.Function.Name,
+		ToolArgs:   toolCall.Function.Arguments,
+		ToolResult: result,
+		Latency:    latency,
+	}
+
+	if err != nil {
+		event.Error = err.Error()
+	}
+
+	t.Emit(event)
 }
 
 func main() {
@@ -218,12 +290,29 @@ func getWeather(city string) ToolResult {
 }
 
 func agentLoop(ctx context.Context, cfg config.Config, messages []Message, toolRegistry *ToolRegistry) (string, error) {
+	tracer := NewTracer()
 	for i := 0; i < maxLoopIterations; i++ {
+		startTime := time.Now()
 		respBody, err := callModel(ctx, cfg.OpenRouterAPIKey, messages, toolRegistry.Definitions())
+		latency := time.Since(startTime)
 		if err != nil {
+			tracer.Emit(TraceEvent{
+				Iteration:   i,
+				Event:       "model_call",
+				Latency:     latency,
+				ModelInput:  messages,
+				ModelOutput: respBody,
+				Error:       err.Error(),
+			})
 			return "", fmt.Errorf("call model: %w", err)
 		}
-		log.Println(respBody)
+		tracer.Emit(TraceEvent{
+			Iteration:   i,
+			Event:       "model_call",
+			ModelInput:  messages,
+			ModelOutput: respBody,
+			Latency:     latency,
+		})
 
 		var chatResp ChatResponse
 
@@ -248,7 +337,7 @@ func agentLoop(ctx context.Context, cfg config.Config, messages []Message, toolR
 
 		toolCalls := message.ToolCalls
 
-		toolMessages, err1 := executeToolCalls(ctx, toolRegistry, toolCalls)
+		toolMessages, err1 := executeToolCalls(ctx, tracer, i, toolRegistry, toolCalls)
 		if err1 != nil {
 			return "", err1
 		}
@@ -257,16 +346,20 @@ func agentLoop(ctx context.Context, cfg config.Config, messages []Message, toolR
 	return "", fmt.Errorf("max loop iterations reached without a final answer")
 }
 
-func executeToolCalls(ctx context.Context, registry *ToolRegistry, toolCalls []ToolCall) ([]Message, error) {
+func executeToolCalls(ctx context.Context, tracer *Tracer, iteration int, registry *ToolRegistry, toolCalls []ToolCall) ([]Message, error) {
 	messages := make([]Message, 0, len(toolCalls))
 	for _, toolCall := range toolCalls {
+		startTime := time.Now()
 		toolResult, err := executeToolCall(ctx, registry, toolCall)
+		latency := time.Since(startTime)
 		if err != nil {
+			tracer.ToolCall(iteration, toolCall, nil, latency, err)
 			return messages, fmt.Errorf("execute tool call %q: %w", toolCall.Function.Name, err)
 		}
 
 		toolContent, err := json.Marshal(toolResult)
 		if err != nil {
+			tracer.ToolCall(iteration, toolCall, toolResult, latency, err)
 			return messages, fmt.Errorf("marshal tool result for tool call %q: %w", toolCall.Function.Name, err)
 		}
 
@@ -275,6 +368,7 @@ func executeToolCalls(ctx context.Context, registry *ToolRegistry, toolCalls []T
 			Content:    string(toolContent),
 			ToolCallID: toolCall.ID,
 		})
+		tracer.ToolCall(iteration, toolCall, toolResult, latency, nil)
 	}
 	return messages, nil
 }
