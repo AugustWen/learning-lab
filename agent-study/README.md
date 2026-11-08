@@ -3,7 +3,7 @@
 本目录使用独立的 Go 模块，依赖与 `go-study` 分开管理。
 
 - `agent-loop/`：复制自 `go-study/llm-basics/02-tool-calling`，包含现有实现和测试。
-- `mcp/`：预留 MCP 实验目录。
+- `mcp/`：MCP Server、Client 与 Agent 工具适配器。
 - `skills/`：预留 Skills 实验目录。
 - `internal/config/`：本模块使用的配置加载代码。
 
@@ -12,6 +12,7 @@
 ```sh
 cp config.example.json config.json
 # 在 config.json 中填入自己的 OpenRouter API Key
+go build -o ./bin/server ./mcp/server
 go run ./agent-loop
 ```
 

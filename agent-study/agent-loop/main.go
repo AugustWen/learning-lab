@@ -9,9 +9,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os/exec"
 	"time"
 
+	adaptmcp "example.com/agent-study/mcp/adapter"
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"example.com/agent-study/internal/config"
 	"example.com/agent-study/tools"
@@ -187,11 +190,31 @@ func main() {
 	messages := []Message{
 		{
 			Role:    "user",
-			Content: "What's the weather today in Singapore?",
+			Content: "请调用 add 工具计算 12.5 + 7.5，再调用 multiply 工具将结果乘以 3。",
 		},
 	}
 
 	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "agent-loop", Version: "v1.0.0"}, nil)
+	transport := &mcp.CommandTransport{Command: exec.Command("./bin/server")}
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		log.Fatalf("connect MCP server: %v", err)
+	}
+	defer session.Close()
+	result, err := session.ListTools(ctx, nil)
+	if err != nil {
+		log.Fatalf("list MCP tools: %v", err)
+	}
+	for _, tool := range result.Tools {
+		registered, err := adaptmcp.AdaptMCPTool(session, tool)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := toolRegistry.RegisterTool(registered); err != nil {
+			log.Fatal(err)
+		}
+	}
 	answer, err := agentLoop(ctx, cfg, messages, toolRegistry)
 	if err != nil {
 		log.Fatal(err)

@@ -31,19 +31,31 @@ func main() {
 	log.Print("Available tools:")
 	RegisteredTools := make(map[string]agent.RegisteredTool)
 	for _, tool := range listToolResults.Tools {
+		parameters, ok := tool.InputSchema.(map[string]any)
+		if !ok {
+			log.Fatalf("工具 %s 的 InputSchema 类型不支持：%T",
+				tool.Name, tool.InputSchema)
+		}
 		RegisteredTools[tool.Name] = agent.RegisteredTool{
 			Name:        tool.Name,
 			Description: tool.Description,
-			Parameters:  tool.,
+			Parameters:  parameters,
 		}
 		log.Printf(" - %s: %s", tool.Name, tool.Description)
 	}
 
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "add",
+		Arguments: map[string]any{
+			"a": 2,
+			"b": 3,
+		},
+	})
 	if err != nil {
 		log.Fatal("CallTool error:", err)
 	}
 	if res.IsError {
-		log.Fatal("tool failed:", res.GetError())
+		log.Fatal("tool failed: ", res.Content)
 	}
 	for _, c := range res.Content {
 		log.Print(c.(*mcp.TextContent).Text)
