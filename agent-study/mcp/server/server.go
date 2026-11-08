@@ -111,7 +111,7 @@ func mcpHandler(tool agent.RegisteredTool) mcp.ToolHandlerFor[AddArgs, agent.Too
 	}
 }
 
-func main() {
+func newServer() *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "greeter", Version: "v1.0.0"}, nil)
 	addTool := addToolRegister()
 	multiplyTool := multiplyToolRegister()
@@ -120,7 +120,11 @@ func main() {
 	mcp.AddTool(server, &mcp.Tool{Name: addTool.Name, Description: addTool.Description, InputSchema: addTool.Parameters}, mcpHandler(addTool))
 	mcp.AddTool(server, &mcp.Tool{Name: multiplyTool.Name, Description: multiplyTool.Description, InputSchema: multiplyTool.Parameters}, mcpHandler(multiplyTool))
 
-	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+	return server
+}
+
+func main() {
+	if err := newServer().Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatal(err)
 	}
 }

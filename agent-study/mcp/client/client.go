@@ -6,6 +6,8 @@ import (
 	"os/exec"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	agent "example.com/agent-study/tools"
 )
 
 func main() {
@@ -22,15 +24,21 @@ func main() {
 	}
 	defer session.Close()
 
-	// Call a tool on the server
-	param := &mcp.CallToolParams{
-		Name: "add",
-		Arguments: map[string]any{
-			"a": 2,
-			"b": 3,
-		},
+	listToolResults, err := session.ListTools(ctx, nil)
+	if err != nil {
+		log.Fatal("ListTools error:", err)
 	}
-	res, err := session.CallTool(ctx, param)
+	log.Print("Available tools:")
+	RegisteredTools := make(map[string]agent.RegisteredTool)
+	for _, tool := range listToolResults.Tools {
+		RegisteredTools[tool.Name] = agent.RegisteredTool{
+			Name:        tool.Name,
+			Description: tool.Description,
+			Parameters:  tool.,
+		}
+		log.Printf(" - %s: %s", tool.Name, tool.Description)
+	}
+
 	if err != nil {
 		log.Fatal("CallTool error:", err)
 	}
