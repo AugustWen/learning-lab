@@ -14,15 +14,16 @@ import (
 	"github.com/google/uuid"
 
 	"example.com/agent-study/internal/config"
+	"example.com/agent-study/tools"
 )
 
 const maxLoopIterations = 5
 
 const (
-	ErrInvalidArgument     = "INVALID_ARGUMENT"
-	ErrUnknownToolFunction = "UNKNOWN_TOOL_FUNCTION"
-	ErrToolExecution       = "TOOL_EXECUTION_ERROR"
-	ErrToolTimeout         = "TOOL_TIMEOUT"
+	ErrInvalidArgument     = tools.ErrInvalidArgument
+	ErrUnknownToolFunction = tools.ErrUnknownToolFunction
+	ErrToolExecution       = tools.ErrToolExecution
+	ErrToolTimeout         = tools.ErrToolTimeout
 )
 
 type ChatRequest struct {
@@ -51,26 +52,10 @@ type ToolFunction struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
-type ToolResult struct {
-	OK    bool       `json:"ok"`
-	Data  any        `json:"data,omitempty"`
-	Error *ToolError `json:"error,omitempty"`
-}
-
-type ToolError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-type ToolHandler func(ctx context.Context, args json.RawMessage) (ToolResult, error)
-
-type RegisteredTool struct {
-	Name        string
-	Description string
-	Parameters  map[string]any
-	Handler     ToolHandler
-	Timeout     time.Duration
-}
+type ToolResult = tools.ToolResult
+type ToolError = tools.ToolError
+type ToolHandler = tools.ToolHandler
+type RegisteredTool = tools.RegisteredTool
 
 type ToolRegistry struct {
 	tools map[string]RegisteredTool

@@ -9,7 +9,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	agent "agent-study/agent-loop"
+	agent "example.com/agent-study/tools"
 )
 
 type Input struct {
@@ -55,7 +55,7 @@ func addToolRegister() agent.RegisteredTool {
 					},
 				}, nil
 			}
-			return agent.ToolResult{OK: true, Value: addArgs.A + addArgs.B}, nil
+			return agent.ToolResult{OK: true, Data: addArgs.A + addArgs.B}, nil
 		},
 		Timeout: 5 * time.Second,
 	}
@@ -91,9 +91,23 @@ func multiplyToolRegister() agent.RegisteredTool {
 					},
 				}, nil
 			}
-			return agent.ToolResult{OK: true, Value: multiplyArgs.A * multiplyArgs.B}, nil
+			return agent.ToolResult{OK: true, Data: multiplyArgs.A * multiplyArgs.B}, nil
 		},
 		Timeout: 5 * time.Second,
+	}
+}
+
+// mcpHandler adapts the shared tool handler to the MCP typed interface.
+func mcpHandler(tool agent.RegisteredTool) mcp.ToolHandlerFor[AddArgs, agent.ToolResult] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, input AddArgs) (*mcp.CallToolResult, agent.ToolResult, error) {
+		args, err := json.Marshal(input)
+		if err != nil {
+			return nil, agent.ToolResult{}, err
+		}
+		ctx, cancel := context.WithTimeout(ctx, tool.Timeout)
+		defer cancel()
+		result, err := tool.Handler(ctx, args)
+		return &mcp.CallToolResult{IsError: !result.OK}, result, err
 	}
 }
 
@@ -103,8 +117,8 @@ func main() {
 	multiplyTool := multiplyToolRegister()
 
 	// Register the tools with the server
-	mcp.AddTool(server, &mcp.Tool{Name: addTool.Name, Description: addTool.Description}, addTool.Handler)
-	mcp.AddTool(server, &mcp.Tool{Name: multiplyTool.Name, Description: multiplyTool.Description}, multiplyTool.Handler)
+	mcp.AddTool(server, &mcp.Tool{Name: addTool.Name, Description: addTool.Description, InputSchema: addTool.Parameters}, mcpHandler(addTool))
+	mcp.AddTool(server, &mcp.Tool{Name: multiplyTool.Name, Description: multiplyTool.Description, InputSchema: multiplyTool.Parameters}, mcpHandler(multiplyTool))
 
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatal(err)

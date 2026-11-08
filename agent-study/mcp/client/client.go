@@ -24,9 +24,10 @@ func main() {
 
 	// Call a tool on the server
 	param := &mcp.CallToolParams{
-		Name: "greet",
+		Name: "add",
 		Arguments: map[string]any{
-			"name": "you",
+			"a": 2,
+			"b": 3,
 		},
 	}
 	res, err := session.CallTool(ctx, param)
